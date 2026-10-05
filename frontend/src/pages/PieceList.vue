@@ -62,6 +62,7 @@ const stats = computed(() => ({
   working: pieceStore.pieces.filter((row) => row.state === '制作中').length,
   annealed: pieceStore.pieces.filter((row) => row.state === '已退火').length,
   inspected: pieceStore.pieces.filter((row) => row.state === '已检验').length,
+  suspended: pieceStore.suspendedPieces.length,
   avgThickness:
     pieceStore.pieces.length === 0
       ? 0
@@ -158,8 +159,33 @@ function handleFilterChange(key: string, value: string): void {
       <StatBadge label="制作中" :value="stats.working" suffix="件" tone="warning" icon="TrendCharts" />
       <StatBadge label="已退火" :value="stats.annealed" suffix="件" tone="primary" icon="Histogram" />
       <StatBadge label="已检验" :value="stats.inspected" suffix="件" tone="success" icon="PieChart" />
+      <StatBadge
+        label="对账挂起"
+        :value="stats.suspended"
+        suffix="件"
+        :tone="stats.suspended > 0 ? 'danger' : 'default'"
+        icon="Warning"
+        hint="工序上写的窑号与设备台账对不上时挂起，重新对账对上后自动解除"
+      />
       <StatBadge label="平均壁厚" :value="stats.avgThickness" suffix="mm" tone="default" icon="TrendCharts" />
     </div>
+
+    <el-alert
+      v-if="stats.suspended > 0"
+      type="error"
+      show-icon
+      :closable="false"
+      class="mb-14"
+      :title="`有 ${stats.suspended} 件作品因窑号与设备台账对不上被挂起`"
+    >
+      <template #default>
+        <div class="suspend-list">
+          <div v-for="row in pieceStore.suspendedPieces" :key="row.id">
+            {{ row.name }}：{{ row.suspendReason }}
+          </div>
+        </div>
+      </template>
+    </el-alert>
 
     <el-card shadow="never">
       <template #header>
@@ -212,9 +238,12 @@ function handleFilterChange(key: string, value: string): void {
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="工艺 / 状态" width="230">
+        <el-table-column label="工艺 / 状态" width="260">
           <template #default="{ row }">
-            <StageTag :stage="row.state" :craft="row.craft" size="small" />
+            <div class="cell-stack">
+              <StageTag :stage="row.state" :craft="row.craft" size="small" />
+              <el-tag v-if="row.suspended" size="small" type="danger" effect="dark">窑号对账挂起</el-tag>
+            </div>
           </template>
         </el-table-column>
         <el-table-column label="料液批次" min-width="220">
@@ -354,6 +383,14 @@ function handleFilterChange(key: string, value: string): void {
 .cell-sub {
   font-size: 12px;
   color: #8b95a1;
+}
+
+.suspend-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+  line-height: 1.8;
 }
 
 .progress-cell {

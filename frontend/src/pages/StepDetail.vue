@@ -2,6 +2,8 @@
 /**
  * /pieces/:id/steps 吹制工序逐道记录
  * 拖拽排序并回填温度、时长与操作人；任一前序未完成则阻断进入退火排位。
+ * 每道工序挂「当时那台窑炉」，温度按那时窑炉上限卡住；
+ * 窑炉保温/停窑给出提示，超上限只退回这一道，对账挂起件暂停作业，老记录只读。
  * 消费模型：Step、Piece、GlassBatch、Furnace；复用组件：<StageTag>、<StatBadge>、<EmptyPanel>
  */
 import { computed, onMounted, reactive, ref } from 'vue'
@@ -14,8 +16,16 @@ import { useStepProgress } from '@/hooks/useStepProgress'
 import { useFurnaceStore } from '@/stores/furnaceStore'
 import { usePieceStore } from '@/stores/pieceStore'
 import { STEP_NAME_OPTIONS, STEP_STATE_OPTIONS, type Step, type StepDraft, type StepName, type StepState } from '@/types/step'
+import type { Furnace } from '@/types/furnace'
 import { buildStepCardText, copyText } from '@/utils/export'
-import { CRAFT_TEMP_RANGE, checkStepTemp, formatHours, totalAnnealHours } from '@/utils/thermal'
+import {
+  CRAFT_TEMP_RANGE,
+  checkStepCap,
+  checkStepTemp,
+  formatHours,
+  furnaceStateNotice,
+  totalAnnealHours,
+} from '@/utils/thermal'
 
 const route = useRoute()
 const router = useRouter()
@@ -42,6 +52,7 @@ const form = reactive<StepDraft>({
   operator: '',
   remark: '',
   state: '未开始',
+  furnaceId: '',
 })
 
 const rules: FormRules<StepDraft> = {
@@ -51,6 +62,7 @@ const rules: FormRules<StepDraft> = {
   durationMin: [{ required: true, message: '请填写时长', trigger: 'blur' }],
   operator: [{ required: true, message: '请填写操作人', trigger: 'blur' }],
   state: [{ required: true, message: '请选择工序状态', trigger: 'change' }],
+  furnaceId: [{ required: true, message: '请挂上当时所用窑炉', trigger: 'change' }],
 }
 
 const steps = computed<Step[]>(() => pieceStore.stepsOf(pieceId.value))
@@ -58,17 +70,55 @@ const steps = computed<Step[]>(() => pieceStore.stepsOf(pieceId.value))
 const batch = computed(() =>
   piece.value === null ? undefined : furnaceStore.batches.find((row) => row.id === piece.value?.batchId)
 )
-const furnace = computed(() =>
+/** 作品料液归属的默认窑炉（设备台账侧） */
+const defaultFurnace = computed<Furnace | undefined>(() =>
   batch.value === undefined ? undefined : furnaceStore.furnaces.find((row) => row.id === batch.value?.furnaceId)
 )
 
-const tempCheck = computed(() =>
-  piece.value === null
+/** 本表单当前所选窑炉（工序要挂的那台） */
+const selectedFurnace = computed<Furnace | undefined>(() =>
+  furnaceStore.furnaces.find((row) => row.id === form.furnaceId)
+)
+
+/** 吹制作业可选的熔化/坩埚窑（含已挂但不在作业池的窑，兜底显示） */
+const furnaceOptions = computed<Furnace[]>(() => {
+  const pool = furnaceStore.meltingFurnaces
+  const extra = selectedFurnace.value && !pool.some((row) => row.id === selectedFurnace.value?.id)
+    ? [selectedFurnace.value]
+    : []
+  return [...extra, ...pool]
+})
+
+/** 温度按「当时窑炉上限」硬卡 */
+const capCheck = computed(() =>
+  selectedFurnace.value === undefined
+    ? { ok: false, message: '请先选择这道工序当时所用的窑炉。' }
+    : checkStepCap(form.tempC, selectedFurnace.value.maxTempC, selectedFurnace.value.code)
+)
+
+/** 工艺适宜区间提示（软性） */
+const craftCheck = computed(() =>
+  piece.value === null || selectedFurnace.value === undefined
     ? { ok: true, message: '' }
-    : checkStepTemp(form.tempC, furnace.value?.maxTempC ?? 1250, piece.value.craft)
+    : checkStepTemp(form.tempC, selectedFurnace.value.maxTempC, piece.value.craft)
+)
+
+/** 窑炉运行态提示（保温 / 停窑 / 升温） */
+const stateNotice = computed(() =>
+  selectedFurnace.value === undefined ? null : furnaceStateNotice(selectedFurnace.value.state)
 )
 
 const currentStep = computed<Step | null>(() => steps.value.find((row) => row.state !== '已完成') ?? null)
+const suspended = computed(() => piece.value?.suspended ?? false)
+const overLimitCount = computed(
+  () => steps.value.filter((row) => !row.legacy && row.checkState === '超上限').length
+)
+const legacyCount = computed(() => steps.value.filter((row) => row.legacy).length)
+
+/** 窑号快照 → 窑炉行（列表展示窑态用） */
+function stepFurnace(row: Step): Furnace | undefined {
+  return pieceStore.furnaceOfStep(row.furnaceId)
+}
 
 onMounted(() => {
   void furnaceStore.loadAll()
@@ -76,6 +126,10 @@ onMounted(() => {
 })
 
 function openCreate(): void {
+  if (suspended.value) {
+    ElMessage.warning(pieceStore.suspendReasonOf(pieceId.value) || '该件已挂起，暂不能新增工序。')
+    return
+  }
   editingId.value = null
   const nextSeq = steps.value.length + 1
   Object.assign(form, {
@@ -87,11 +141,16 @@ function openCreate(): void {
     operator: currentStep.value?.operator ?? '',
     remark: '',
     state: '未开始' as StepState,
+    furnaceId: currentStep.value?.furnaceId || defaultFurnace.value?.id || furnaceOptions.value[0]?.id || '',
   })
   dialogVisible.value = true
 }
 
 function openEdit(row: Step): void {
+  if (row.legacy) {
+    ElMessage.info('这是升级前没记窑号、又回填不了归属的老工序，按规定只读保留。')
+    return
+  }
   editingId.value = row.id
   Object.assign(form, {
     pieceId: row.pieceId,
@@ -102,6 +161,7 @@ function openEdit(row: Step): void {
     operator: row.operator,
     remark: row.remark,
     state: row.state,
+    furnaceId: row.furnaceId,
   })
   dialogVisible.value = true
 }
@@ -110,25 +170,37 @@ async function handleSubmit(): Promise<void> {
   if (formRef.value === undefined) return
   const valid = await formRef.value.validate().catch(() => false)
   if (!valid) return
-  if (!tempCheck.value.ok) {
-    ElMessage.warning(tempCheck.value.message)
+  // 温度超过当时窑炉上限：只退回这一道，禁止落账
+  if (!capCheck.value.ok) {
+    ElMessage.error(capCheck.value.message)
+    return
   }
+  if (!craftCheck.value.ok) ElMessage.warning(craftCheck.value.message)
+  if (stateNotice.value !== null && !stateNotice.value.ok) ElMessage.warning(stateNotice.value.message)
   submitting.value = true
   try {
-    if (editingId.value === null) {
-      await pieceStore.createStep({ ...form })
-      ElMessage.success(`已新增第 ${form.seq} 道「${form.name}」`)
+    const result =
+      editingId.value === null
+        ? await pieceStore.createStep({ ...form })
+        : ((await pieceStore.updateStep(editingId.value, { ...form }))
+            ? { ok: true, queued: false }
+            : { ok: false, queued: false })
+    if (result.ok) {
+      ElMessage[result.queued ? 'warning' : 'success'](pieceStore.lastMessage)
+      dialogVisible.value = false
     } else {
-      await pieceStore.updateStep(editingId.value, { ...form })
-      ElMessage.success('工序已更新')
+      ElMessage.error(pieceStore.lastMessage)
     }
-    dialogVisible.value = false
   } finally {
     submitting.value = false
   }
 }
 
 async function handleDelete(row: Step): Promise<void> {
+  if (row.legacy) {
+    ElMessage.info('回填不了窑号的老工序只读保留，不能删除。')
+    return
+  }
   try {
     await ElMessageBox.confirm(`确认删除第 ${row.seq} 道「${row.name}」？`, '删除确认', {
       type: 'warning',
@@ -139,12 +211,14 @@ async function handleDelete(row: Step): Promise<void> {
     return
   }
   await pieceStore.deleteStep(row.id)
-  ElMessage.success('工序已删除')
+  ElMessage.success(pieceStore.lastMessage)
 }
 
 async function handleAdvance(row: Step): Promise<void> {
   await pieceStore.advanceStep(row.id)
-  ElMessage.success(pieceStore.lastMessage)
+  ElMessage[pieceStore.isSuspended(row.pieceId) || row.checkState === '超上限' ? 'warning' : 'success'](
+    pieceStore.lastMessage,
+  )
 }
 
 async function handleDrop(targetId: string): Promise<void> {
@@ -158,15 +232,23 @@ async function handleDrop(targetId: string): Promise<void> {
 
 async function handleCopyCard(): Promise<void> {
   if (piece.value === null) return
-  const text = buildStepCardText(piece.value, batch.value, furnace.value, steps.value, [])
+  const text = buildStepCardText(piece.value, batch.value, defaultFurnace.value, steps.value, [])
   const ok = await copyText(text)
   ElMessage[ok ? 'success' : 'warning'](ok ? '工序卡片已复制到剪贴板' : '当前浏览器不支持剪贴板写入')
 }
 
 function goAnnealing(): void {
   if (piece.value === null) return
+  if (suspended.value) {
+    ElMessage.warning(`该件已按窑炉对账挂起，不能进入退火排位：${piece.value.suspendReason}`)
+    return
+  }
   if (!progress.value.allDone) {
     ElMessage.warning(`无法进入退火排位：${progress.value.blockReason}`)
+    return
+  }
+  if (overLimitCount.value > 0) {
+    ElMessage.warning(`有 ${overLimitCount.value} 道工序温度超过当时窑炉上限被退回，处理完再进入退火排位。`)
     return
   }
   pieceStore.selectPiece(piece.value.id)
@@ -183,7 +265,7 @@ function goAnnealing(): void {
       <template #extra>
         <el-space wrap>
           <StageTag v-if="piece" :stage="piece.state" :craft="piece.craft" />
-          <el-tag v-if="furnace" type="info">{{ furnace.code }} · 上限 {{ furnace.maxTempC }} ℃</el-tag>
+          <el-tag v-if="defaultFurnace" type="info">{{ defaultFurnace.code }} · 上限 {{ defaultFurnace.maxTempC }} ℃</el-tag>
           <el-tag v-if="batch" type="success">{{ batch.colorCode }} · 余 {{ batch.remainKg }} kg</el-tag>
           <el-tag v-if="piece" type="warning">理论退火 {{ formatHours(totalAnnealHours(piece.wallThicknessMm)) }}</el-tag>
         </el-space>
@@ -204,6 +286,34 @@ function goAnnealing(): void {
     </EmptyPanel>
 
     <template v-else>
+      <el-alert
+        v-if="suspended"
+        type="error"
+        show-icon
+        :closable="false"
+        class="mb-14"
+        title="该件已按窑炉对账挂起"
+        :description="`${piece?.suspendReason ?? ''} 请到「检验归档」页重新对账，窑号对上后自动解除。`"
+      />
+      <el-alert
+        v-if="!suspended && overLimitCount > 0"
+        type="error"
+        show-icon
+        :closable="false"
+        class="mb-14"
+        :title="`有 ${overLimitCount} 道工序温度超过当时窑炉上限，已只退回这一道`"
+        description="已烧成的老工序原样保留；请在被标红的工序上调低温度或更换窑炉后重记，再推进。"
+      />
+      <el-alert
+        v-if="legacyCount > 0"
+        type="info"
+        show-icon
+        :closable="false"
+        class="mb-14"
+        :title="`有 ${legacyCount} 道升级前的老工序没记窑号且回填不了归属，已设为只读`"
+        description="这些老记录仅作追溯展示，不能编辑、推进或删除，也不参与窑炉对账与温度重算。"
+      />
+
       <div class="stat-row">
         <StatBadge label="工序总数" :value="progress.total" suffix="道" tone="primary" icon="Histogram" />
         <StatBadge label="已完成" :value="progress.done" suffix="道" tone="success" icon="DataLine" />
@@ -252,7 +362,7 @@ function goAnnealing(): void {
                 <el-icon><Right /></el-icon>
                 <span>进入退火排位</span>
               </el-button>
-              <el-button type="primary" @click="openCreate">
+              <el-button type="primary" :disabled="suspended" @click="openCreate">
                 <el-icon><Plus /></el-icon>
                 <span>新增工序</span>
               </el-button>
@@ -263,7 +373,7 @@ function goAnnealing(): void {
         <EmptyPanel
           v-if="steps.length === 0"
           title="该作品还没有吹制工序"
-          description="按取料 → 吹制 → 塑形 → 开模 → 收口逐道登记温度、时长与操作人；列表支持拖拽调整先后顺序。"
+          description="每道工序都要挂上当时所用的窑炉，温度会按那时窑炉的上限卡住；按取料 → 吹制 → 塑形 → 开模 → 收口逐道登记，列表支持拖拽排序。"
           action-text="登记第一道工序"
           @action="openCreate"
         />
@@ -273,15 +383,20 @@ function goAnnealing(): void {
             v-for="(row, index) in steps"
             :key="row.id"
             class="step-item"
-            :class="{ 'is-drag-over': dragOverId === row.id, 'is-current': currentStep?.id === row.id }"
-            draggable="true"
+            :class="{
+              'is-drag-over': dragOverId === row.id,
+              'is-current': currentStep?.id === row.id,
+              'is-over-limit': !row.legacy && row.checkState === '超上限',
+              'is-legacy': row.legacy,
+            }"
+            :draggable="!row.legacy && !suspended"
             @dragstart="draggingId = row.id"
             @dragover.prevent="dragOverId = row.id"
             @dragleave="dragOverId = null"
             @drop.prevent="handleDrop(row.id)"
           >
             <span class="step-seq">{{ index + 1 }}</span>
-            <span class="step-grip" title="按住拖拽调整工序顺序">⠿</span>
+            <span class="step-grip" :title="row.legacy || suspended ? '' : '按住拖拽调整工序顺序'">⠿</span>
             <div class="step-main">
               <div class="step-title">
                 <b>{{ row.name }}</b>
@@ -291,10 +406,20 @@ function goAnnealing(): void {
                 >
                   {{ row.state }}
                 </el-tag>
+                <el-tag v-if="!row.legacy" size="small" type="primary" effect="plain">
+                  {{ row.furnaceCode || '（未挂窑）' }}
+                  <span v-if="stepFurnace(row)"> · {{ stepFurnace(row)?.state }}</span>
+                </el-tag>
+                <el-tag v-if="!row.legacy && row.checkState === '超上限'" size="small" type="danger" effect="dark">
+                  超上限退回
+                </el-tag>
+                <el-tag v-if="row.legacy" size="small" type="info" effect="plain">老记录 · 只读</el-tag>
                 <el-tag v-if="currentStep?.id === row.id" size="small" type="danger" effect="dark">当前道次</el-tag>
               </div>
               <div class="step-sub">
-                {{ row.tempC }} ℃ · {{ row.durationMin }} 分钟 · 操作人 {{ row.operator }}
+                {{ row.tempC }} ℃
+                <template v-if="!row.legacy">/ 上限 {{ row.capTempC }} ℃</template>
+                · {{ row.durationMin }} 分钟 · 操作人 {{ row.operator }}
                 <span v-if="row.remark !== ''"> · {{ row.remark }}</span>
               </div>
             </div>
@@ -303,13 +428,15 @@ function goAnnealing(): void {
                 size="small"
                 type="primary"
                 plain
-                :disabled="row.state === '已完成'"
+                :disabled="row.state === '已完成' || row.legacy || suspended || row.checkState === '超上限'"
                 @click="handleAdvance(row)"
               >
                 推进状态
               </el-button>
-              <el-button size="small" @click="openEdit(row)">编辑</el-button>
-              <el-button size="small" type="danger" plain @click="handleDelete(row)">删除</el-button>
+              <el-button size="small" :disabled="row.legacy || suspended" @click="openEdit(row)">编辑</el-button>
+              <el-button size="small" type="danger" plain :disabled="row.legacy || suspended" @click="handleDelete(row)">
+                删除
+              </el-button>
             </div>
           </li>
         </ul>
@@ -339,6 +466,16 @@ function goAnnealing(): void {
             </el-form-item>
           </el-col>
         </el-row>
+        <el-form-item label="当时窑炉" prop="furnaceId">
+          <el-select v-model="form.furnaceId" filterable style="width: 100%" placeholder="选择这道工序当时所用的窑炉">
+            <el-option
+              v-for="item in furnaceOptions"
+              :key="item.id"
+              :value="item.id"
+              :label="`${item.code} · ${item.type} · ${item.state} · 上限 ${item.maxTempC} ℃`"
+            />
+          </el-select>
+        </el-form-item>
         <el-row :gutter="12">
           <el-col :span="8">
             <el-form-item label="温度（℃）" prop="tempC">
@@ -360,20 +497,36 @@ function goAnnealing(): void {
           <el-input v-model="form.remark" type="textarea" :rows="2" placeholder="如：分三次吹气成型 / 夹持颈部收细" />
         </el-form-item>
         <el-alert
-          :type="tempCheck.ok ? 'success' : 'warning'"
+          v-if="selectedFurnace"
+          :type="capCheck.ok ? 'success' : 'error'"
           show-icon
           :closable="false"
-          :title="tempCheck.message"
-          :description="
-            piece === null
-              ? ''
-              : `「${piece.craft}」适宜温度区间 ${CRAFT_TEMP_RANGE[piece.craft].min}–${CRAFT_TEMP_RANGE[piece.craft].max} ℃；所选窑炉上限 ${furnace?.maxTempC ?? 1250} ℃。`
+          class="mb-8"
+          :title="capCheck.message"
+        />
+        <el-alert
+          v-if="stateNotice"
+          :type="stateNotice.ok ? 'info' : 'warning'"
+          show-icon
+          :closable="false"
+          class="mb-8"
+          :title="stateNotice.message"
+        />
+        <el-alert
+          v-if="piece && selectedFurnace"
+          :type="craftCheck.ok ? 'info' : 'warning'"
+          show-icon
+          :closable="false"
+          :title="
+            craftCheck.message ||
+            `「${piece.craft}」适宜温度区间 ${CRAFT_TEMP_RANGE[piece.craft].min}–${CRAFT_TEMP_RANGE[piece.craft].max} ℃。`
           "
+          :description="`温度硬卡以当时窑炉上限 ${selectedFurnace.maxTempC} ℃ 为准；超出只退回这一道，已烧成的老工序不动。`"
         />
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" :loading="submitting" @click="handleSubmit">保存</el-button>
+        <el-button type="primary" :loading="submitting" :disabled="!capCheck.ok" @click="handleSubmit">保存</el-button>
       </template>
     </el-dialog>
   </div>
@@ -428,6 +581,20 @@ function goAnnealing(): void {
 
 .step-item.is-current {
   background: #fffaf6;
+}
+
+.step-item.is-over-limit {
+  border-color: #c0392b;
+  background: #fdf3f2;
+}
+
+.step-item.is-legacy {
+  background: #f6f7f9;
+  opacity: 0.85;
+}
+
+.step-item.is-legacy .step-grip {
+  cursor: not-allowed;
 }
 
 .step-seq {

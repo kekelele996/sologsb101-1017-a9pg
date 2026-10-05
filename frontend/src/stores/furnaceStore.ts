@@ -7,6 +7,8 @@ import { defineStore } from 'pinia'
 import { liveQuery } from 'dexie'
 import type { Furnace, FurnaceDraft, FurnaceState, FurnaceType } from '../types/furnace'
 import type { GlassBatch, GlassBatchDraft } from '../types/batch'
+import type { Piece } from '../types/piece'
+import type { Step } from '../types/step'
 import {
   DB_SCHEMA_VERSION,
   ROW_REVISION,
@@ -16,10 +18,11 @@ import {
   initDatabase,
   putBatch,
   putFurnace,
+  reconcilePieces,
   removeBatch,
   removeFurnace,
 } from '../utils/db'
-import { LOW_REMAIN_KG, isLowRemain } from '../utils/thermal'
+import { LOW_REMAIN_KG, isLowRemain, reconcileByFurnace, type FurnaceReconcileRow } from '../utils/thermal'
 import { nowIso, uuid } from '../utils/id'
 
 /** 窑炉筛选条件 */
@@ -54,6 +57,10 @@ export const useFurnaceStore = defineStore('furnace', () => {
   const furnaces = ref<Furnace[]>([])
   const batches = ref<GlassBatch[]>([])
   const pieces = ref<{ id: string; batchId: string }[]>([])
+  /** 技师侧工序镜像（只读）：用于设备侧按窑炉对账与退回提示 */
+  const steps = ref<Step[]>([])
+  /** 作品挂起镜像（只读） */
+  const suspendedPieces = ref<Piece[]>([])
   const loading = ref(true)
   const ready = ref(false)
   const error = ref('')
@@ -67,6 +74,33 @@ export const useFurnaceStore = defineStore('furnace', () => {
   )
   const annealingFurnaces = computed<Furnace[]>(() => furnaces.value.filter((row) => row.type === '退火窑'))
   const lowRemainBatches = computed<GlassBatch[]>(() => batches.value.filter((row) => isLowRemain(row.remainKg)))
+
+  /** 两边按窑炉对账的派生结果（窑号对不上 / 超上限 / 挂起件数） */
+  const reconcile = computed(() => reconcileByFurnace(furnaces.value, steps.value))
+  const reconcileRowsById = computed<Record<string, FurnaceReconcileRow>>(() =>
+    Object.fromEntries(reconcile.value.rows.map((row) => [row.furnaceId, row]))
+  )
+  /** 窑炉已被删除、工序仍挂着它的孤儿记录数 */
+  const orphanCount = computed<number>(() => reconcile.value.orphans.length)
+  const suspendedCount = computed<number>(() => suspendedPieces.value.filter((row) => row.suspended).length)
+
+  /** 挂在某台窑上、被退回（超当时上限）的未完成工序 */
+  function overLimitStepsOfFurnace(furnaceId: string): Step[] {
+    return steps.value.filter(
+      (row) => row.furnaceId === furnaceId && !row.legacy && row.checkState === '超上限' && row.state !== '已完成',
+    )
+  }
+
+  /** 某台窑上还没推进（未完成）的工序：改最高温度后这些会重算 */
+  function pendingStepsOfFurnace(furnaceId: string): Step[] {
+    return steps.value.filter(
+      (row) => row.furnaceId === furnaceId && !row.legacy && row.state !== '已完成',
+    )
+  }
+
+  function reconcileRowOf(furnaceId: string): FurnaceReconcileRow | undefined {
+    return reconcileRowsById.value[furnaceId]
+  }
 
   const stats = computed<Record<string, FurnaceStat>>(() => {
     const result: Record<string, FurnaceStat> = {}
@@ -114,17 +148,20 @@ export const useFurnaceStore = defineStore('furnace', () => {
       if (!subscribed) {
         subscribed = true
         liveQuery(async () => {
-          const [furnaceRows, batchRows, pieceRows] = await Promise.all([
+          const [furnaceRows, batchRows, pieceRows, stepRows] = await Promise.all([
             db.furnaces.toArray(),
             db.batches.toArray(),
             db.pieces.toArray(),
+            db.steps.toArray(),
           ])
-          return { furnaceRows, batchRows, pieceRows }
+          return { furnaceRows, batchRows, pieceRows, stepRows }
         }).subscribe({
-          next: ({ furnaceRows, batchRows, pieceRows }) => {
+          next: ({ furnaceRows, batchRows, pieceRows, stepRows }) => {
             furnaces.value = [...furnaceRows].sort((a, b) => a.code.localeCompare(b.code, 'zh-Hans-CN'))
             batches.value = [...batchRows].sort((a, b) => b.meltDate.localeCompare(a.meltDate))
             pieces.value = pieceRows.map((row) => ({ id: row.id, batchId: row.batchId }))
+            suspendedPieces.value = pieceRows.filter((row) => row.suspended)
+            steps.value = [...stepRows].sort((a, b) => a.pieceId.localeCompare(b.pieceId) || a.seq - b.seq)
             loading.value = false
             ready.value = true
             error.value = ''
@@ -173,6 +210,8 @@ export const useFurnaceStore = defineStore('furnace', () => {
   async function updateFurnace(furnaceId: string, draft: FurnaceDraft): Promise<void> {
     const existing = furnaces.value.find((row) => row.id === furnaceId)
     if (existing === undefined) return
+    const maxChanged = existing.maxTempC !== draft.maxTempC
+    const pendingCount = pendingStepsOfFurnace(furnaceId).length
     await putFurnace({
       ...existing,
       code: draft.code.trim() || existing.code,
@@ -182,6 +221,12 @@ export const useFurnaceStore = defineStore('furnace', () => {
       state: draft.state,
     })
     revision.value += 1
+    if (maxChanged) {
+      lastMessage.value =
+        pendingCount > 0
+          ? `「${draft.code}」最高温度已改为 ${draft.maxTempC} ℃，挂在该窑、还没推进的 ${pendingCount} 道工序已按新上限重算（烧成的老工序不动）。`
+          : `「${draft.code}」最高温度已改为 ${draft.maxTempC} ℃，没有需要重算的未推进工序。`
+    }
   }
 
   async function deleteFurnace(furnaceId: string): Promise<void> {
@@ -258,9 +303,20 @@ export const useFurnaceStore = defineStore('furnace', () => {
     counts.value = { ...result, schemaVersion: DB_SCHEMA_VERSION }
   }
 
+  /** 设备侧发起按窑炉对账：窑号对不上的作品挂起，对上后解除 */
+  async function runReconcile(): Promise<number> {
+    const count = await reconcilePieces()
+    revision.value += 1
+    lastMessage.value =
+      count > 0 ? `对账完成：${count} 件作品窑号对不上，已挂起。` : '对账完成：工序窑号与设备台账全部一致。'
+    return count
+  }
+
   return {
     furnaces,
     batches,
+    steps,
+    suspendedPieces,
     loading,
     ready,
     error,
@@ -273,8 +329,16 @@ export const useFurnaceStore = defineStore('furnace', () => {
     lowRemainBatches,
     stats,
     visibleFurnaces,
+    reconcile,
+    reconcileRowsById,
+    orphanCount,
+    suspendedCount,
     statOf,
     batchesOf,
+    overLimitStepsOfFurnace,
+    pendingStepsOfFurnace,
+    reconcileRowOf,
+    runReconcile,
     loadAll,
     setFilters,
     resetFilters,

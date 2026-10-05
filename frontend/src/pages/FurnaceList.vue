@@ -90,11 +90,33 @@ const totals = computed(() => ({
   runningCount: store.furnaces.filter((row) => row.state === '运行').length,
   meltFurnaces: store.meltingFurnaces.length,
   annealFurnaces: store.annealingFurnaces.length,
+  suspended: store.suspendedCount,
+  orphans: store.orphanCount,
 }))
+
+/** 全库被退回（超当时上限）的未完成工序 */
+const overLimitSteps = computed(() =>
+  store.furnaces.flatMap((furnace) =>
+    store.overLimitStepsOfFurnace(furnace.id).map((step) => ({
+      step,
+      furnaceCode: furnace.code,
+    })),
+  )
+)
 
 onMounted(() => {
   void store.loadAll()
 })
+
+async function handleReconcile(): Promise<void> {
+  const count = await store.runReconcile()
+  ElMessage[count > 0 ? 'warning' : 'success'](store.lastMessage)
+}
+
+/** 正在编辑的窑上，还没推进、改上限后会被重算的工序数 */
+const pendingRecalcCount = computed<number>(() =>
+  editingFurnaceId.value === null ? 0 : store.pendingStepsOfFurnace(editingFurnaceId.value).length
+)
 
 function openCreateFurnace(): void {
   editingFurnaceId.value = null
@@ -261,8 +283,42 @@ function handleFurnaceFilter(key: string, value: string): void {
         icon="Warning"
         :hint="`剩余量低于 ${LOW_REMAIN_KG} kg 的料液批次数量`"
       />
+      <StatBadge
+        label="对账挂起作品"
+        :value="totals.suspended"
+        suffix="件"
+        :tone="totals.suspended > 0 ? 'danger' : 'default'"
+        icon="Warning"
+        hint="工序上写的窑号跟设备台账对不上而挂起的作品数"
+      />
     </div>
 
+    <el-alert
+      v-if="totals.suspended > 0 || totals.orphans > 0"
+      type="error"
+      show-icon
+      :closable="false"
+      class="mb-14"
+      :title="`按窑炉对账发现 ${totals.suspended} 件挂起作品、${totals.orphans} 道窑炉缺失的工序`"
+      description="工序上写的窑号与设备台账那份对不上（含窑炉已删除）时，整件作品挂起；请到「检验归档」页查看明细，改挂窑炉或恢复窑号后重新对账。"
+    />
+    <el-alert
+      v-if="overLimitSteps.length > 0"
+      type="warning"
+      show-icon
+      :closable="false"
+      class="mb-14"
+      :title="`有 ${overLimitSteps.length} 道未推进工序温度超过当时窑炉上限，已被退回`"
+    >
+      <template #default>
+        <div class="over-list">
+          <div v-for="item in overLimitSteps" :key="item.step.id">
+            作品 {{ item.step.pieceId }} · 第 {{ item.step.seq }} 道「{{ item.step.name }}」：
+            {{ item.step.tempC }} ℃ ＞ 上限 {{ item.step.capTempC }} ℃（{{ item.furnaceCode }}），只退回这一道。
+          </div>
+        </div>
+      </template>
+    </el-alert>
     <el-alert
       v-if="store.lowRemainBatches.length > 0"
       type="warning"
@@ -285,10 +341,16 @@ function handleFurnaceFilter(key: string, value: string): void {
       <template #header>
         <div class="card-header">
           <span class="card-header__title">窑炉台账</span>
-          <el-button type="primary" @click="openCreateFurnace">
-            <el-icon><Plus /></el-icon>
-            <span>新建窑炉</span>
-          </el-button>
+          <el-space>
+            <el-button type="warning" plain @click="handleReconcile">
+              <el-icon><Refresh /></el-icon>
+              <span>按窑炉对账</span>
+            </el-button>
+            <el-button type="primary" @click="openCreateFurnace">
+              <el-icon><Plus /></el-icon>
+              <span>新建窑炉</span>
+            </el-button>
+          </el-space>
         </div>
       </template>
 
@@ -347,6 +409,28 @@ function handleFurnaceFilter(key: string, value: string): void {
             <span :class="{ 'cell-warn': store.statOf(row.id).lowCount > 0 }">
               {{ store.statOf(row.id).lowCount }} 批
             </span>
+          </template>
+        </el-table-column>
+        <el-table-column label="挂窑工序" width="100" align="right">
+          <template #default="{ row }">{{ store.reconcileRowOf(row.id)?.stepCount ?? 0 }} 道</template>
+        </el-table-column>
+        <el-table-column label="超上限退回" width="110" align="right">
+          <template #default="{ row }">
+            <span :class="{ 'cell-warn': (store.reconcileRowOf(row.id)?.overLimitCount ?? 0) > 0 }">
+              {{ store.reconcileRowOf(row.id)?.overLimitCount ?? 0 }} 道
+            </span>
+          </template>
+        </el-table-column>
+        <el-table-column label="窑号不符 / 挂起" width="140" align="right">
+          <template #default="{ row }">
+            <el-space :size="4">
+              <el-tag size="small" :type="(store.reconcileRowOf(row.id)?.mismatchCount ?? 0) > 0 ? 'danger' : 'success'">
+                不符 {{ store.reconcileRowOf(row.id)?.mismatchCount ?? 0 }}
+              </el-tag>
+              <el-tag size="small" :type="(store.reconcileRowOf(row.id)?.suspendedPieceCount ?? 0) > 0 ? 'danger' : 'info'">
+                挂起 {{ store.reconcileRowOf(row.id)?.suspendedPieceCount ?? 0 }}
+              </el-tag>
+            </el-space>
           </template>
         </el-table-column>
         <el-table-column label="操作" width="260" fixed="right">
@@ -479,6 +563,13 @@ function handleFurnaceFilter(key: string, value: string): void {
           :closable="false"
           title="退火窑保存后会自动进入窑位池（A1–C3 共 9 个窑位），可在退火编排页分配。"
         />
+        <el-alert
+          v-if="editingFurnaceId && pendingRecalcCount > 0"
+          type="warning"
+          show-icon
+          :closable="false"
+          :title="`该窑上有 ${pendingRecalcCount} 道还没推进的工序，保存后会按新的最高温度重新卡上限；已烧成的老工序原样保留。`"
+        />
       </el-form>
       <template #footer>
         <el-button @click="furnaceDialog = false">取消</el-button>
@@ -601,6 +692,14 @@ function handleFurnaceFilter(key: string, value: string): void {
 }
 
 .low-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+  line-height: 1.8;
+}
+
+.over-list {
   display: flex;
   flex-direction: column;
   gap: 2px;

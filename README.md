@@ -42,7 +42,7 @@ docker compose up -d --build       # 改完代码后重新构建
 | 构建 | Vite 6 | 开发端口与宿主端口一致（22817） |
 | 路由 | Vue Router 4 | `createWebHistory` + 路由懒加载 |
 | 状态管理 | Pinia 2 | setup store，跨页状态集中在 store，页面只读 store |
-| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbglassblow`，`v1 → v2` 为 Piece 增加 craft 索引并回填默认值 |
+| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbglassblow`，`v1 → v2` 为 Piece 增加 craft 索引并回填默认值；`v2 → v3` 为工序挂窑炉（窑号/上限快照）、作品增加对账挂起、新增技师侧落账重试表 `stepOutbox` |
 | 容器 | node:20-alpine → nginx:alpine | 多阶段构建，`chmod -R a+rX` 规避静态资源 403 |
 
 ---
@@ -100,21 +100,27 @@ sologsb101-1017/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbglassblow`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`
   * `db.version(1)`：建立全部表与 `[pieceId+seq]` 复合索引；
   * `db.version(2)`：**为 `Piece` 增加 `craft` 索引并回填默认值**，同时补齐其余索引与字段：
     * `.upgrade()` 中逐行回填 `revision` / `createdAt` / `updatedAt`；
     * `pieces.craft` 缺失时回填 `吹制`，`pieces.state` 缺失时回填 `设计中`；
     * `steps.state` 缺失时按历史记录视为 `已完成`，避免升级后被误判为待办；
     * `anneals` 补齐 `outAt` 与 `curveSeg`，`inspects` 补齐 `defectNote`。
+  * `db.version(3)`：**工序挂窑炉、作品对账挂起、技师侧重试队列**：
+    * `steps` 增加 `furnaceId`、`furnaceCode`（当时窑号快照）、`capTempC`（当时上限快照）、`checkState`、`checkedAt`、`legacy`，并为 `furnaceId` / `checkState` 建索引；
+    * **旧工序没记窑号：升级时按归属回填**（作品 → 料液批次 → 窑炉），沿归属链找到窑炉就写回窑号 / 上限并只标核对结果；归属链断了（批次或窑炉已删）填不了的，置 `legacy = true`，**老记录只读**（不能编辑 / 推进 / 删除，也不参与重算与对账）；
+    * `pieces` 增加 `suspended` / `suspendReason`（对账挂起）并为 `suspended` 建索引；
+    * 新增 `stepOutbox` 表：技师侧落账失败时的本侧重试队列，与设备表完全分离。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
   | --- | --- | --- |
   | `furnaces` | id | code, type, state, fuelType, createdAt, updatedAt |
   | `batches` | id | furnaceId, colorCode, meltDate, remainKg |
-  | `pieces` | id | batchId, state, artist, **craft**, name |
-  | `steps` | id | pieceId, **[pieceId+seq]**, seq, state, name |
+  | `pieces` | id | batchId, state, artist, **craft**, name, **suspended** |
+  | `steps` | id | pieceId, **[pieceId+seq]**, seq, state, name, **furnaceId, checkState** |
+  | `stepOutbox` | id | **stepId, op, attempts, updatedAt（v3 新增）** |
   | `anneals` | id | pieceId, kilnSlot, state, inAt, curveSeg |
   | `inspects` | id | pieceId, date, result, inspector |
 
@@ -160,6 +166,20 @@ npm run preview      # 预览 dist 产物
   **冲突时提交按钮禁用**并给出冲突的既有记录说明。
 * **温度单位换算**：℃ ↔ ℉（`cToF` / `fToC`）。
 * **工序温度校验**：不得超过所选窑炉的 `maxTempC`，且应落在工艺适宜区间（吹制 900–1200 ℃ / 铸造 800–1150 ℃ / 热塑 700–1000 ℃）附近。
+* **每道工序挂当时窑炉，温度按那时上限硬卡**：工序保存 `furnaceId` + 窑号快照 `furnaceCode` + 上限快照 `capTempC`；
+  录温度时只按**当时那台窑炉的上限**卡（`checkStepCap`），超出**只退回这一道**（禁止落账 / 标 `超上限` / 不可推进），
+  **已烧成（已完成）的老工序原样保留**，绝不回改。
+* **窑炉保温 / 停窑仍记温度的提醒**：所选窑炉降为「保温」给提示、「停窑检修」给阻断式警告，
+  避免技师照旧往工序里记温度、出炉才发现对不上；最终仍由上限硬卡与对账兜底。
+* **窑炉最高温度改动后重算未推进工序**：设备员改 `maxTempC` 后，只重算挂在该窑、**尚未推进到「已完成」**的工序，
+  刷新其上限快照与 `checkState`（`recalcStepsForFurnace`）；温度本身不改、老工序不动，由技师决定调温度还是换窑。
+* **两边按窑炉对账，对不上就挂起这一件**：设备台账（窑号）与工序台账（`furnaceCode` 快照）按窑炉比对
+  （`reconcileByFurnace` / `reconcilePieces`），窑号不符或窑炉已删除（孤儿记录）即把该作品置 `suspended`：
+  挂起件不可新增 / 编辑 / 推进工序、不可进入退火排位与分配窑位；重新对账窑号对上后**自动解除**。
+  窑炉台账页与检验归档页都可发起「按窑炉对账」，并按窑显示挂窑工序数 / 超上限道数 / 窑号不符 / 挂起件数。
+* **技师落账失败按本侧重试，设备侧不受影响**：工序写入失败只进技师侧 `stepOutbox` 队列（与 furnaces/batches 分表），
+  应用启动时自动 `flushStepOutbox()`，检验归档页可手动「按本侧重试」/清空；整个失败与重试过程不触碰设备台账。
+* **旧数据回填与只读**：v3 升级时老工序按「作品 → 料液批次 → 窑炉」归属回填窑号 / 上限；填不了的置 `legacy` 只读保留。
 * **设计尺寸校验**：壁厚需 ≥ 1.5 mm 且小于设计高度的 1/8，否则给出成型与退火难度提示。
 * **前序阻断**：任一前序工序未推进到「已完成」，`/pieces/:id/steps` 的「进入退火排位」会给出明确阻断原因。
 * **状态回写**：退火状态推进到「已出炉」即把作品状态回写为「已退火」；登记出炉检验后回写为「已检验」；

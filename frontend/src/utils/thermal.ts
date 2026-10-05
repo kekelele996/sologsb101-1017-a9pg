@@ -7,6 +7,8 @@
  */
 import type { Anneal, CurveSeg } from '../types/anneal'
 import type { Craft } from '../types/piece'
+import type { Furnace, FurnaceState } from '../types/furnace'
+import type { Step, StepCheckState } from '../types/step'
 
 /** 保留 1 位小数 */
 export function round1(value: number): number {
@@ -197,6 +199,213 @@ export function checkStepTemp(tempC: number, maxTempC: number, craft: Craft): Te
     }
   }
   return { ok: true, message: `工序温度 ${tempC} ℃ 落在「${craft}」的合理区间内。` }
+}
+
+/**
+ * 工序温度的「硬上限」校验：只按当时窑炉上限卡温度。
+ * 超过上限只退回这一道（返回 ok=false），不影响已烧成的老工序。
+ */
+export function checkStepCap(tempC: number, capTempC: number, furnaceCode?: string): TempCheck {
+  if (tempC > capTempC) {
+    const where = furnaceCode === undefined || furnaceCode === '' ? '' : `（窑炉 ${furnaceCode}）`
+    return {
+      ok: false,
+      message: `工序温度 ${tempC} ℃ 超过当时窑炉上限 ${capTempC} ℃${where}，该道退回，请调低温度或更换窑炉后重记。`,
+    }
+  }
+  return { ok: true, message: `工序温度 ${tempC} ℃ 未超过当时窑炉上限 ${capTempC} ℃。` }
+}
+
+/**
+ * 窑炉运行态提示：窑炉降成保温或停窑检修后，继续往里记温度需格外核对。
+ * 仅提示，不阻断（温度仍由上限硬卡与对账兜底）。
+ */
+export function furnaceStateNotice(state: FurnaceState): TempCheck | null {
+  if (state === '保温') {
+    return { ok: true, message: '该窑已降为保温：可记录温度，请按保温工况核对，避免出炉后与设备台账对不上。' }
+  }
+  if (state === '停窑') {
+    return {
+      ok: false,
+      message: '该窑已停窑检修：设备台账显示不可作业，请确认是否改挂其它在役窑炉后再记这一道。',
+    }
+  }
+  if (state === '升温') {
+    return { ok: true, message: '该窑正在升温：请确认温度已达到作业区间再记这一道。' }
+  }
+  return null
+}
+
+/** 窑炉是否处于可正常作业状态 */
+export function isFurnaceOperable(state: FurnaceState): boolean {
+  return state === '运行' || state === '保温'
+}
+
+/** 重算后一道工序的落库变更 */
+export interface StepRecalcChange {
+  stepId: string
+  pieceId: string
+  furnaceCode: string
+  capTempC: number
+  checkState: StepCheckState
+}
+
+/**
+ * 窑炉最高温度改动后的「未推进工序重算」。
+ * 只重算挂在这台窑上、尚未推进到「已完成」的工序；已烧成的老工序原样保留。
+ * 以新上限重新卡温度，刷新核对结果与上限快照；返回需要落库的变更清单（纯函数，不写库）。
+ */
+export function recalcStepsForFurnace(
+  steps: Step[],
+  furnace: Pick<Furnace, 'id' | 'code' | 'maxTempC'>,
+): StepRecalcChange[] {
+  const changes: StepRecalcChange[] = []
+  steps.forEach((step) => {
+    if (step.legacy) return // 填不了窑号的老记录只读，不参与重算
+    if (step.furnaceId !== furnace.id) return
+    if (step.state === '已完成') return // 烧成的老工序留着原样
+    changes.push({
+      stepId: step.id,
+      pieceId: step.pieceId,
+      furnaceCode: furnace.code,
+      capTempC: furnace.maxTempC,
+      checkState: step.tempC > furnace.maxTempC ? '超上限' : '正常',
+    })
+  })
+  return changes
+}
+
+/* ------------------------------ 按窑炉对账 ------------------------------ */
+
+/** 单道工序的对账结果 */
+export interface ReconcileStepIssue {
+  stepId: string
+  pieceId: string
+  seq: number
+  name: Step['name']
+  /** 工序上写的窑号（技师侧快照） */
+  stepFurnaceCode: string
+  /** 设备台账此刻的窑号；窑炉已删除时为空串 */
+  ledgerCode: string
+  kind: '窑号不符' | '窑炉缺失'
+}
+
+/** 每台窑炉的对账行 */
+export interface FurnaceReconcileRow {
+  furnaceId: string
+  furnaceCode: string
+  state: FurnaceState
+  maxTempC: number
+  /** 挂在该窑的工序道数（不含填不了窑号的老记录） */
+  stepCount: number
+  /** 其中温度超过当时上限的道数 */
+  overLimitCount: number
+  /** 窑号对不上的道数 */
+  mismatchCount: number
+  /** 受对账牵连、被挂起的作品数 */
+  suspendedPieceCount: number
+  issues: ReconcileStepIssue[]
+}
+
+/** 全量对账结果 */
+export interface ReconcileResult {
+  rows: FurnaceReconcileRow[]
+  /** 窑炉已删除、工序仍挂着它的孤儿记录（工序上的窑号在设备台账已不存在） */
+  orphans: ReconcileStepIssue[]
+  /** 每件作品是否挂起及原因（只列有工序的作品） */
+  pieceStatus: Array<{ pieceId: string; suspended: boolean; reason: string }>
+  /** 被挂起作品总数 */
+  suspendedCount: number
+}
+
+/**
+ * 两边按窑炉对账：
+ * 工序上写的窑号（furnaceCode 快照 + furnaceId）与设备台账那份对不上，
+ * 就把这一件作品挂起。窑炉已删除同样视为对不上。
+ * 纯函数：不改数据，只产出对账结论，由存储层据此回写挂起标记。
+ */
+export function reconcileByFurnace(
+  furnaces: Furnace[],
+  steps: Step[],
+): ReconcileResult {
+  const furnaceById = new Map(furnaces.map((furnace) => [furnace.id, furnace]))
+  const activeSteps = steps.filter((step) => !step.legacy && step.furnaceId !== '')
+
+  // 每件作品收集对账问题
+  const issuesByPiece = new Map<string, ReconcileStepIssue[]>()
+  const pushIssue = (issue: ReconcileStepIssue): void => {
+    const list = issuesByPiece.get(issue.pieceId) ?? []
+    list.push(issue)
+    issuesByPiece.set(issue.pieceId, list)
+  }
+
+  const rows: FurnaceReconcileRow[] = furnaces.map((furnace) => {
+    const own = activeSteps.filter((step) => step.furnaceId === furnace.id)
+    const issues: ReconcileStepIssue[] = []
+    own.forEach((step) => {
+      if (step.furnaceCode !== furnace.code) {
+        issues.push({
+          stepId: step.id,
+          pieceId: step.pieceId,
+          seq: step.seq,
+          name: step.name,
+          stepFurnaceCode: step.furnaceCode,
+          ledgerCode: furnace.code,
+          kind: '窑号不符',
+        })
+      }
+    })
+    issues.forEach(pushIssue)
+    const overLimit = own.filter((step) => step.checkState === '超上限').length
+    return {
+      furnaceId: furnace.id,
+      furnaceCode: furnace.code,
+      state: furnace.state,
+      maxTempC: furnace.maxTempC,
+      stepCount: own.length,
+      overLimitCount: overLimit,
+      mismatchCount: issues.length,
+      suspendedPieceCount: 0,
+      issues,
+    }
+  })
+
+  // 窑炉缺失：工序挂的 furnaceId 在设备台账已不存在
+  const orphans: ReconcileStepIssue[] = []
+  activeSteps.forEach((step) => {
+    if (!furnaceById.has(step.furnaceId)) {
+      orphans.push({
+        stepId: step.id,
+        pieceId: step.pieceId,
+        seq: step.seq,
+        name: step.name,
+        stepFurnaceCode: step.furnaceCode,
+        ledgerCode: '',
+        kind: '窑炉缺失',
+      })
+    }
+  })
+  orphans.forEach(pushIssue)
+
+  // 有工序的作品逐一判定挂起
+  const pieceIds = Array.from(new Set(activeSteps.map((step) => step.pieceId)))
+  const pieceStatus = pieceIds.map((pieceId) => {
+    const issues = issuesByPiece.get(pieceId) ?? []
+    if (issues.length === 0) return { pieceId, suspended: false, reason: '' }
+    const codes = Array.from(new Set(issues.map((issue) => issue.stepFurnaceCode || '（空窑号）')))
+    const reason =
+      `工序窑号与设备台账对不上（${issues.length} 道：${codes.join(' / ')}），` +
+      '该件已挂起，请核对窑号或改挂窑炉后重新对账。'
+    return { pieceId, suspended: true, reason }
+  })
+
+  const suspendedSet = new Set(pieceStatus.filter((item) => item.suspended).map((item) => item.pieceId))
+  rows.forEach((row) => {
+    const pieces = new Set(row.issues.map((issue) => issue.pieceId).filter((id) => suspendedSet.has(id)))
+    row.suspendedPieceCount = pieces.size
+  })
+
+  return { rows, orphans, pieceStatus, suspendedCount: suspendedSet.size }
 }
 
 /** 设计尺寸比例校验：壁厚与高度需匹配 */

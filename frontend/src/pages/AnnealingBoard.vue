@@ -125,6 +125,10 @@ async function handleSubmit(): Promise<void> {
   if (formRef.value === undefined) return
   const valid = await formRef.value.validate().catch(() => false)
   if (!valid) return
+  if (pieceStore.isSuspended(form.pieceId)) {
+    ElMessage.error(`该件已按窑炉对账挂起，不能分配退火窑位：${pieceStore.suspendReasonOf(form.pieceId)}`)
+    return
+  }
   if (conflict.value.conflict) {
     ElMessage.error(conflict.value.message)
     return
@@ -346,7 +350,8 @@ function handleFilterChange(key: string, value: string): void {
                   v-for="item in pieceStore.pieces"
                   :key="item.id"
                   :value="item.id"
-                  :label="`${item.name} · ${item.craft} · 壁厚 ${item.wallThicknessMm} mm`"
+                  :disabled="item.suspended"
+                  :label="`${item.name} · ${item.craft} · 壁厚 ${item.wallThicknessMm} mm${item.suspended ? ' · 窑号对账挂起' : ''}`"
                 />
               </el-select>
             </el-form-item>

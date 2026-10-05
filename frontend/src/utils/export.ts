@@ -73,7 +73,10 @@ export function parseSnapshot(text: string): SnapshotParseResult {
       return { ok: false, message: `存档缺少 ${String(key)} 数组。`, snapshot: null }
     }
   }
-  return { ok: true, message: '存档校验通过。', snapshot: data as DatabaseSnapshot }
+  // stepOutbox 为 v3 新增：旧版 v2 存档没有该数组，按空队列兼容
+  const snapshot = data as DatabaseSnapshot
+  if (!Array.isArray(snapshot.stepOutbox)) snapshot.stepOutbox = []
+  return { ok: true, message: '存档校验通过。', snapshot }
 }
 
 /** 生成窑务排产汇总 CSV（一件作品一行） */
@@ -90,12 +93,15 @@ export function buildScheduleCsv(
     '工艺',
     '创作者',
     '状态',
+    '挂起',
     '设计高度(mm)',
     '壁厚(mm)',
     '料液色号',
-    '所属窑炉',
+    '归属窑炉',
     '工序数',
     '已完成工序',
+    '超上限退回',
+    '窑号不符工序',
     '累计工时(分钟)',
     '退火记录数',
     '退火窑位',
@@ -113,18 +119,27 @@ export function buildScheduleCsv(
     const latestAnneal = pieceAnneals.length > 0 ? pieceAnneals[pieceAnneals.length - 1] : null
     const pieceInspects = inspects.filter((row) => row.pieceId === piece.id).sort((a, b) => a.date.localeCompare(b.date))
     const latestInspect = pieceInspects.length > 0 ? pieceInspects[pieceInspects.length - 1] : null
+    const overLimit = pieceSteps.filter((row) => !row.legacy && row.checkState === '超上限').length
+    const mismatch = pieceSteps.filter((row) => {
+      if (row.legacy || row.furnaceId === '') return false
+      const ledger = furnaces.find((item) => item.id === row.furnaceId)
+      return !ledger || ledger.code !== row.furnaceCode
+    }).length
     lines.push(
       [
         piece.name,
         piece.craft,
         piece.artist,
         piece.state,
+        piece.suspended ? '挂起' : '正常',
         piece.designHeightMm,
         piece.wallThicknessMm,
         batch?.colorCode ?? '—',
         furnace?.code ?? '—',
         pieceSteps.length,
         pieceSteps.filter((row) => row.state === '已完成').length,
+        overLimit,
+        mismatch,
         Math.round(pieceSteps.reduce((acc, row) => acc + row.durationMin, 0) * 10) / 10,
         pieceAnneals.length,
         latestAnneal?.kilnSlot ?? '—',
@@ -191,10 +206,13 @@ export function buildStepCardText(
     .slice()
     .sort((a, b) => a.seq - b.seq)
     .forEach((row) => {
+      const kiln = row.legacy
+        ? '老记录·窑号缺失（只读）'
+        : `${row.furnaceCode || '未挂窑'}·上限 ${row.capTempC} ℃${row.checkState === '超上限' ? '·超上限退回' : ''}`
       lines.push(
         `  ${row.seq}. ${row.name} · ${row.tempC} ℃ · ${row.durationMin} 分钟 · ${row.operator} · ${
           row.state
-        }${row.remark === '' ? '' : ` · ${row.remark}`}`,
+        } · ${kiln}${row.remark === '' ? '' : ` · ${row.remark}`}`,
       )
     })
   if (anneals.length > 0) {

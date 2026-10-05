@@ -48,3 +48,16 @@ body {
     padding: 12px;
   }
 }
+
+/* 通用间距工具类 */
+.mt-14 {
+  margin-top: 14px;
+}
+
+.mb-14 {
+  margin-bottom: 14px;
+}
+
+.mb-8 {
+  margin-bottom: 8px;
+}

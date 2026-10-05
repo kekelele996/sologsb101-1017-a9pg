@@ -55,6 +55,44 @@ const pieceLabel = computed<Record<string, string>>(() =>
   Object.fromEntries(pieceStore.pieces.map((row) => [row.id, `${row.name} · ${row.craft}`]))
 )
 
+/** 按窑炉对账结果（设备侧派生） */
+const reconcileRows = computed(() => furnaceStore.reconcile.rows)
+const reconcileOrphans = computed(() => furnaceStore.reconcile.orphans)
+const suspendedPieces = computed(() => pieceStore.suspendedPieces)
+const outboxRows = computed(() => pieceStore.outbox)
+
+const pieceNameOf = (pieceId: string): string => pieceLabel.value[pieceId] ?? `（作品 ${pieceId}）`
+
+/** 窑号不符明细文本 */
+function mismatchText(issues: Array<{ seq: number; stepFurnaceCode: string }>): string {
+  return issues.map((issue) => `第${issue.seq}道写「${issue.stepFurnaceCode}」`).join('；')
+}
+
+async function handleReconcile(): Promise<void> {
+  const count = await pieceStore.runReconcile()
+  ElMessage[count > 0 ? 'warning' : 'success'](pieceStore.lastMessage)
+}
+
+async function handleRetryOutbox(): Promise<void> {
+  const remaining = await pieceStore.retryOutbox()
+  await pieceStore.loadOutbox()
+  ElMessage[remaining === 0 ? 'success' : 'warning'](pieceStore.lastMessage)
+}
+
+async function handleDiscardOutbox(): Promise<void> {
+  try {
+    await ElMessageBox.confirm('清空后这些待落账工序将不再重试，确认清空技师侧重试队列？', '确认清空', {
+      type: 'warning',
+      confirmButtonText: '清空',
+      cancelButtonText: '取消',
+    })
+  } catch {
+    return
+  }
+  await pieceStore.discardOutbox()
+  ElMessage.success('已清空待重试队列')
+}
+
 const filtered = computed<Inspect[]>(() => {
   const key = keyword.value.trim().toLowerCase()
   return rows.value
@@ -221,9 +259,138 @@ const defectRows = computed<Inspect[]>(() => rows.value.filter((row) => row.resu
         :suffix="`· ${DB_NAME}`"
         tone="info"
         icon="Histogram"
-        hint="IndexedDB 库名与结构版本；v2 为 Piece 增加 craft 索引并回填默认值"
+        hint="IndexedDB 库名与结构版本；v3 为工序挂窑炉、作品对账挂起、新增技师侧重试队列"
       />
     </div>
+
+    <el-card shadow="never" class="mb-14">
+      <template #header>
+        <div class="card-header">
+          <span class="card-header__title">按窑炉对账（设备台账 ↔ 工序台账）</span>
+          <el-button type="warning" plain @click="handleReconcile">
+            <el-icon><Refresh /></el-icon>
+            <span>重新对账</span>
+          </el-button>
+        </div>
+      </template>
+
+      <el-alert
+        v-if="suspendedPieces.length === 0 && reconcileOrphans.length === 0"
+        type="success"
+        show-icon
+        :closable="false"
+        title="全部作品工序上写的窑号与设备台账一致，没有挂起件。"
+        description="每道工序都快照了当时窑号与温度上限；窑炉改号 / 删除后可点「重新对账」，对不上会自动挂起，对上即解除。"
+      />
+
+      <div v-else class="reconcile-wrap">
+        <el-alert
+          v-if="suspendedPieces.length > 0"
+          type="error"
+          show-icon
+          :closable="false"
+          class="mb-14"
+          :title="`${suspendedPieces.length} 件作品窑号对不上已挂起（不可新增 / 推进工序、不可进入退火排位）`"
+        >
+          <template #default>
+            <div class="suspend-detail">
+              <div v-for="row in suspendedPieces" :key="row.id">
+                <b>{{ row.name }}</b>：{{ row.suspendReason }}
+              </div>
+            </div>
+          </template>
+        </el-alert>
+
+        <el-table :data="reconcileRows" row-key="furnaceId" size="small" stripe>
+          <el-table-column prop="furnaceCode" label="窑号" width="110" />
+          <el-table-column label="状态" width="100">
+            <template #default="{ row }">
+              <StageTag :furnace-state="row.state" size="small" />
+            </template>
+          </el-table-column>
+          <el-table-column prop="maxTempC" label="上限(℃)" width="100" align="right" />
+          <el-table-column prop="stepCount" label="挂窑工序" width="100" align="right" />
+          <el-table-column label="超上限" width="90" align="right">
+            <template #default="{ row }">
+              <span :class="{ 'cell-warn': row.overLimitCount > 0 }">{{ row.overLimitCount }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="窑号不符" width="90" align="right">
+            <template #default="{ row }">
+              <span :class="{ 'cell-warn': row.mismatchCount > 0 }">{{ row.mismatchCount }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="挂起作品" width="90" align="right">
+            <template #default="{ row }">
+              <span :class="{ 'cell-warn': row.suspendedPieceCount > 0 }">{{ row.suspendedPieceCount }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="不符明细" min-width="260">
+            <template #default="{ row }">
+              <span v-if="row.issues.length === 0" class="cell-sub">一致</span>
+              <span v-else class="cell-warn">{{ mismatchText(row.issues) }}</span>
+            </template>
+          </el-table-column>
+        </el-table>
+
+        <el-alert
+          v-if="reconcileOrphans.length > 0"
+          type="error"
+          show-icon
+          :closable="false"
+          class="mt-14"
+          :title="`${reconcileOrphans.length} 道工序所挂窑炉在设备台账已不存在（窑炉缺失）`"
+        >
+          <template #default>
+            <div class="suspend-detail">
+              <div v-for="issue in reconcileOrphans" :key="issue.stepId">
+                {{ pieceNameOf(issue.pieceId) }} · 第 {{ issue.seq }} 道「{{ issue.name }}」仍写着窑号
+                「{{ issue.stepFurnaceCode || '（空）' }}」。
+              </div>
+            </div>
+          </template>
+        </el-alert>
+      </div>
+    </el-card>
+
+    <el-card shadow="never" class="mb-14">
+      <template #header>
+        <div class="card-header">
+          <span class="card-header__title">技师侧落账重试队列（与设备台账互不连坐）</span>
+          <el-space>
+            <el-button type="primary" plain :disabled="outboxRows.length === 0" @click="handleRetryOutbox">
+              <el-icon><RefreshRight /></el-icon>
+              <span>按本侧重试（{{ outboxRows.length }}）</span>
+            </el-button>
+            <el-button type="danger" plain :disabled="outboxRows.length === 0" @click="handleDiscardOutbox">
+              清空队列
+            </el-button>
+          </el-space>
+        </div>
+      </template>
+
+      <el-alert
+        v-if="outboxRows.length === 0"
+        type="success"
+        show-icon
+        :closable="false"
+        title="没有待重试的落账：技师台账写入正常。"
+        description="技师落账失败时只进这张本侧重试表，设备侧窑炉 / 料液台账不受影响；重试成功后自动出队。"
+      />
+      <el-table v-else :data="outboxRows" row-key="id" size="small" stripe>
+        <el-table-column prop="stepId" label="工序 id" min-width="200" />
+        <el-table-column label="动作" width="90">
+          <template #default="{ row }">
+            <el-tag size="small" :type="row.op === 'put' ? 'warning' : 'danger'">
+              {{ row.op === 'put' ? '写入' : '删除' }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="attempts" label="尝试次数" width="90" align="right" />
+        <el-table-column prop="updatedAt" label="最近尝试" width="200" />
+        <el-table-column prop="lastError" label="失败原因" min-width="260" />
+      </el-table>
+    </el-card>
 
     <el-alert
       v-if="defectRows.length > 0"
@@ -443,6 +610,24 @@ const defectRows = computed<Inspect[]>(() => rows.value.filter((row) => row.resu
   gap: 2px;
   font-size: 12px;
   line-height: 1.8;
+}
+
+.reconcile-wrap {
+  display: flex;
+  flex-direction: column;
+}
+
+.suspend-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+  line-height: 1.8;
+}
+
+.cell-warn {
+  color: #c0392b;
+  font-weight: 600;
 }
 
 .mb-14 {
