@@ -85,6 +85,7 @@ function go(path: string): void {
           当前作品：{{ pieceStore.currentPiece.name }}（{{ pieceStore.currentPiece.state }}）
         </el-tag>
         <el-tag v-else type="info">未选择作品</el-tag>
+        <el-tag v-if="pieceStore.suspendedCount > 0" type="danger" effect="dark">已挂起 {{ pieceStore.suspendedCount }} 件</el-tag>
         <el-tag v-if="lowRemain > 0" type="danger" effect="dark">待补料 {{ lowRemain }} 批</el-tag>
       </div>
     </header>

@@ -215,6 +215,9 @@ function handleFilterChange(key: string, value: string): void {
         <el-table-column label="工艺 / 状态" width="230">
           <template #default="{ row }">
             <StageTag :stage="row.state" :craft="row.craft" size="small" />
+            <el-tooltip v-if="row.suspended" :content="row.suspendReason" placement="top">
+              <el-tag size="small" type="danger" effect="dark" class="suspended-tag">已挂起</el-tag>
+            </el-tooltip>
           </template>
         </el-table-column>
         <el-table-column label="料液批次" min-width="220">
@@ -360,6 +363,10 @@ function handleFilterChange(key: string, value: string): void {
   display: flex;
   flex-direction: column;
   gap: 4px;
+}
+
+.suspended-tag {
+  margin-left: 6px;
 }
 
 .mb-14 {

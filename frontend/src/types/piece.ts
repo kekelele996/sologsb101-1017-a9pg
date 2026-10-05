@@ -31,6 +31,10 @@ export interface Piece {
   artist: string
   /** 作品状态 */
   state: PieceState
+  /** 对账挂起：工序窑号与设备侧对不上时置 true，挂起期间阻断进入退火排位 */
+  suspended: boolean
+  /** 挂起原因（对账不一致说明） */
+  suspendReason: string
   createdAt: string
   updatedAt: string
   revision: number

@@ -13,12 +13,13 @@ import {
   countAll,
   db,
   initDatabase,
+  postStep,
   putPiece,
-  putStep,
   removePiece,
   removeStep,
   reorderSteps,
   syncPieceState,
+  syncPieceSuspensions,
 } from '../utils/db'
 import { buildStepProgress, type StepProgress } from '../hooks/useStepProgress'
 import { nowIso, uuid } from '../utils/id'
@@ -95,6 +96,9 @@ export const usePieceStore = defineStore('piece', () => {
     () => pieces.value.filter((row) => row.state === '设计中' || row.state === '制作中').length
   )
 
+  /** 对账挂起件数（工序窑号与设备侧对不上） */
+  const suspendedCount = computed<number>(() => pieces.value.filter((row) => row.suspended).length)
+
   async function loadAll(): Promise<void> {
     loading.value = true
     error.value = ''
@@ -125,6 +129,8 @@ export const usePieceStore = defineStore('piece', () => {
           },
         })
       }
+      // 载入后按窑炉重新对账，刷新挂起标记
+      await syncPieceSuspensions()
       await refreshCounts()
     } catch (err) {
       error.value = err instanceof Error ? err.message : '初始化本地数据库失败'
@@ -156,6 +162,8 @@ export const usePieceStore = defineStore('piece', () => {
       craft: draft.craft,
       artist: draft.artist.trim(),
       state: draft.state,
+      suspended: false,
+      suspendReason: '',
       createdAt: stamp,
       updatedAt: stamp,
       revision: ROW_REVISION,
@@ -193,8 +201,9 @@ export const usePieceStore = defineStore('piece', () => {
 
   /* ------------------------------ 工序 ------------------------------ */
 
-  async function createStep(draft: StepDraft): Promise<Step> {
+  async function createStep(draft: StepDraft): Promise<{ row: Step; ok: boolean; error: string }> {
     const stamp = nowIso()
+    const furnace = draft.furnaceId === '' ? undefined : await db.furnaces.get(draft.furnaceId)
     const row: Step = {
       id: uuid('step'),
       pieceId: draft.pieceId,
@@ -205,19 +214,33 @@ export const usePieceStore = defineStore('piece', () => {
       operator: draft.operator.trim(),
       remark: draft.remark.trim(),
       state: draft.state,
+      furnaceId: furnace?.id ?? '',
+      furnaceCode: furnace?.code ?? '',
+      maxTempC: furnace?.maxTempC ?? 0,
+      posted: true,
+      postError: '',
+      tempAdjusted: false,
+      legacy: false,
       createdAt: stamp,
       updatedAt: stamp,
       revision: ROW_REVISION,
     }
-    await putStep(row)
+    const result = await postStep(row)
     revision.value += 1
-    return row
+    if (result.ok) {
+      await syncPieceSuspensions()
+      lastMessage.value = `已新增第 ${row.seq} 道「${row.name}」`
+    } else {
+      lastMessage.value = `第 ${row.seq} 道「${row.name}」落账失败，已按本侧重试：${result.error}`
+    }
+    return { row, ok: result.ok, error: result.error }
   }
 
-  async function updateStep(stepId: string, draft: StepDraft): Promise<void> {
+  async function updateStep(stepId: string, draft: StepDraft): Promise<{ ok: boolean; error: string }> {
     const existing = steps.value.find((row) => row.id === stepId)
-    if (existing === undefined) return
-    await putStep({
+    if (existing === undefined) return { ok: false, error: '工序不存在' }
+    const furnace = draft.furnaceId === '' ? undefined : await db.furnaces.get(draft.furnaceId)
+    const result = await postStep({
       ...existing,
       seq: draft.seq,
       name: draft.name,
@@ -226,12 +249,41 @@ export const usePieceStore = defineStore('piece', () => {
       operator: draft.operator.trim(),
       remark: draft.remark.trim(),
       state: draft.state,
+      furnaceId: furnace?.id ?? '',
+      furnaceCode: furnace?.code ?? '',
+      maxTempC: furnace?.maxTempC ?? 0,
+      // 编辑后重新落账：清除失败与重算标记，温度以本次录入为准
+      posted: true,
+      postError: '',
+      tempAdjusted: false,
     })
     revision.value += 1
+    if (result.ok) {
+      await syncPieceSuspensions()
+      lastMessage.value = '工序已更新'
+    } else {
+      lastMessage.value = `工序更新落账失败，已按本侧重试：${result.error}`
+    }
+    return { ok: result.ok, error: result.error }
+  }
+
+  /** 技师侧落账失败后重试：只重试本工序写入，不触碰设备侧 */
+  async function retryPost(stepId: string): Promise<{ ok: boolean; error: string }> {
+    const existing = steps.value.find((row) => row.id === stepId)
+    if (existing === undefined) return { ok: false, error: '工序不存在' }
+    const result = await postStep({ ...existing, posted: true, postError: '' })
+    revision.value += 1
+    if (result.ok) {
+      lastMessage.value = `第 ${existing.seq} 道「${existing.name}」重新落账成功`
+    } else {
+      lastMessage.value = `第 ${existing.seq} 道「${existing.name}」重试仍失败：${result.error}`
+    }
+    return result
   }
 
   async function deleteStep(stepId: string): Promise<void> {
     await removeStep(stepId)
+    await syncPieceSuspensions()
     revision.value += 1
     lastMessage.value = '工序已删除，作品状态已重新推导'
   }
@@ -247,8 +299,12 @@ export const usePieceStore = defineStore('piece', () => {
       return
     }
     const next = flow[index + 1]
-    await putStep({ ...existing, state: next })
+    const result = await postStep({ ...existing, state: next, posted: true, postError: '' })
     revision.value += 1
+    if (!result.ok) {
+      lastMessage.value = `第 ${existing.seq} 道「${existing.name}」推进落账失败，已按本侧重试：${result.error}`
+      return
+    }
     const piece = pieces.value.find((row) => row.id === existing.pieceId)
     lastMessage.value = `第 ${existing.seq} 道「${existing.name}」已推进为「${next}」${
       piece === undefined ? '' : `（作品：${piece.name}）`
@@ -308,6 +364,7 @@ export const usePieceStore = defineStore('piece', () => {
     currentPiece,
     visiblePieces,
     inProgressCount,
+    suspendedCount,
     stepsOf,
     progressOf,
     loadAll,
@@ -320,6 +377,7 @@ export const usePieceStore = defineStore('piece', () => {
     createStep,
     updateStep,
     deleteStep,
+    retryPost,
     advanceStep,
     moveStepBefore,
     moveStepToIndex,

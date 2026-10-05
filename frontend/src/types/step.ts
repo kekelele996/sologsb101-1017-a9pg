@@ -30,6 +30,20 @@ export interface Step {
   remark: string
   /** 工序状态 */
   state: StepState
+  /** 挂账窑炉（当时那台）；升级前未记窑号的老记录为空串 */
+  furnaceId: string
+  /** 窑号快照（入账时窑炉的 code），用于与设备侧按窑炉对账 */
+  furnaceCode: string
+  /** 入账时窑炉上限温度（℃）快照；温度按此卡住，已完成工序不随后续改动重算 */
+  maxTempC: number
+  /** 落账状态：true 已落账 / false 落账失败待重试（仅技师侧重试，不触碰设备侧） */
+  posted: boolean
+  /** 最近一次落账失败原因 */
+  postError: string
+  /** 窑炉上限改动后被重算调整过温度（仅未推进工序） */
+  tempAdjusted: boolean
+  /** 升级前遗留、按归属回填不到窑炉的老记录（只读） */
+  legacy: boolean
   createdAt: string
   updatedAt: string
   revision: number
@@ -45,4 +59,6 @@ export interface StepDraft {
   operator: string
   remark: string
   state: StepState
+  /** 挂账窑炉（当时那台） */
+  furnaceId: string
 }

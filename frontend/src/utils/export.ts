@@ -194,7 +194,9 @@ export function buildStepCardText(
       lines.push(
         `  ${row.seq}. ${row.name} · ${row.tempC} ℃ · ${row.durationMin} 分钟 · ${row.operator} · ${
           row.state
-        }${row.remark === '' ? '' : ` · ${row.remark}`}`,
+        } · 窑号 ${row.furnaceCode === '' ? '未挂窑炉（只读）' : row.furnaceCode}${
+          row.tempAdjusted ? ' · 温度已重算' : ''
+        }${row.posted ? '' : ' · 落账失败待重试'}${row.remark === '' ? '' : ` · ${row.remark}`}`,
       )
     })
   if (anneals.length > 0) {

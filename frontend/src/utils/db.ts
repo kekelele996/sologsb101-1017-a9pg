@@ -13,16 +13,18 @@ import type { Step } from '../types/step'
 import type { Anneal } from '../types/anneal'
 import type { Inspect } from '../types/inspect'
 import { nowIso } from './id'
+import { postWithRetry } from './posting'
+import { attributeStepFurnace, reconcileAll, recomputeStepForFurnace } from './reconcile'
 import { seedDatabase } from './seed'
 
 /** 数据库名 */
 export const DB_NAME = 'gbglassblow'
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2
+export const DB_SCHEMA_VERSION = 3
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
 
 class GlassBlowDatabase extends Dexie {
   furnaces!: Table<Furnace, string>
@@ -46,7 +48,7 @@ class GlassBlowDatabase extends Dexie {
     })
 
     // ---------- v2：Piece 增加 craft 索引并回填默认值，补齐其余索引与字段 ----------
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         furnaces: 'id, code, type, state, fuelType, createdAt, updatedAt',
         batches: 'id, furnaceId, colorCode, meltDate, remainKg',
@@ -91,6 +93,57 @@ class GlassBlowDatabase extends Dexie {
         // 迁移 5：检验记录补齐缺陷说明
         await tx.table('inspects').toCollection().modify((row: Record<string, unknown>) => {
           if (typeof row.defectNote !== 'string') row.defectNote = ''
+        })
+      })
+
+    // ---------- v3：工序挂账窑炉（当时那台）+ 按归属回填 + 对账挂起 ----------
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        furnaces: 'id, code, type, state, fuelType, createdAt, updatedAt',
+        batches: 'id, furnaceId, colorCode, meltDate, remainKg',
+        pieces: 'id, batchId, state, artist, craft, name, suspended',
+        // furnaceId 为 v3 新增索引（按窑炉重算 / 对账）
+        steps: 'id, pieceId, [pieceId+seq], seq, state, name, furnaceId',
+        anneals: 'id, pieceId, kilnSlot, state, inAt, curveSeg',
+        inspects: 'id, pieceId, date, result, inspector',
+      })
+      .upgrade(async (tx) => {
+        const [furnaceRows, batchRows, pieceRows, stepRows] = await Promise.all([
+          tx.table('furnaces').toArray(),
+          tx.table('batches').toArray(),
+          tx.table('pieces').toArray(),
+          tx.table('steps').toArray(),
+        ])
+        const furnaceById = new Map<string, Furnace>(furnaceRows.map((row: Furnace) => [row.id, row]))
+        const batchById = new Map<string, GlassBatch>(batchRows.map((row: GlassBatch) => [row.id, row]))
+        const pieceById = new Map<string, Piece>(pieceRows.map((row: Piece) => [row.id, row]))
+
+        // 迁移 1：工序按归属回填挂账窑炉（step → piece → batch → furnace）；填不了的老记录只读
+        const updatedSteps: Step[] = []
+        for (const raw of stepRows) {
+          const row = raw as Step
+          const ref = attributeStepFurnace(row, pieceById, batchById, furnaceById)
+          const patch = {
+            legacy: true,
+            posted: true,
+            postError: '',
+            tempAdjusted: false,
+            furnaceId: ref === null ? '' : ref.furnaceId,
+            furnaceCode: ref === null ? '' : ref.furnaceCode,
+            maxTempC: ref === null ? 0 : ref.maxTempC,
+            revision: ROW_REVISION,
+          }
+          await tx.table('steps').update(row.id, patch)
+          updatedSteps.push({ ...row, ...patch })
+        }
+
+        // 迁移 2：作品补挂起字段，并按回填后的工序窑号与设备侧对账结果初始化挂起标记
+        const reconcileMap = reconcileAll(pieceRows as Piece[], updatedSteps, furnaceRows as Furnace[])
+        await tx.table('pieces').toCollection().modify((raw: Record<string, unknown>) => {
+          const result = reconcileMap.get(String(raw.id))
+          raw.suspended = result?.suspended ?? false
+          raw.suspendReason = result?.reason ?? ''
+          raw.revision = ROW_REVISION
         })
       })
   }
@@ -240,6 +293,82 @@ export async function reorderSteps(orderedIds: string[]): Promise<void> {
   })
 }
 
+/**
+ * 技师侧落账（带重试）：
+ * - 只重试工序写入，绝不把设备侧写入放进同一事务，设备这边不受影响；
+ * - 成功后同步作品状态；失败时把该工序标记为「落账失败 · 待重试」，不触碰窑炉数据。
+ */
+export async function postStep(row: Step): Promise<{ ok: boolean; error: string }> {
+  const result = await postWithRetry(async () => {
+    await db.steps.put({ ...row, posted: true, postError: '', updatedAt: nowIso(), revision: ROW_REVISION })
+  })
+  if (result.ok) {
+    await syncPieceState(row.pieceId)
+    return { ok: true, error: '' }
+  }
+  // 落账失败：标记待重试（仅当该行已存在；新建行尚未落库，由调用方保留表单重试）
+  const existing = await db.steps.get(row.id)
+  if (existing !== undefined) {
+    await db.steps.update(row.id, { posted: false, postError: result.error, updatedAt: nowIso() })
+  }
+  return { ok: false, error: result.error }
+}
+
+/**
+ * 窑炉最高温度改动后，对挂该窑炉且未推进（非「已完成」）的工序重算：
+ * 刷新上限快照，记录温度超出新上限则按新上限卡住；已完成工序原样保留。
+ * 返回重算道数与被卡住道数。
+ */
+export async function recomputeStepsForFurnace(
+  furnaceId: string,
+  newMaxTempC: number,
+): Promise<{ recomputed: number; clamped: number }> {
+  const furnace = await db.furnaces.get(furnaceId)
+  if (furnace === undefined) return { recomputed: 0, clamped: 0 }
+  const rows = await db.steps.where('furnaceId').equals(furnaceId).toArray()
+  let recomputed = 0
+  let clamped = 0
+  await db.transaction('rw', db.steps, async () => {
+    for (const row of rows) {
+      const result = recomputeStepForFurnace(row, { ...furnace, maxTempC: newMaxTempC })
+      if (!result.recomputed) continue
+      await db.steps.put({ ...result.step, updatedAt: nowIso(), revision: ROW_REVISION })
+      recomputed += 1
+      if (result.clamped) clamped += 1
+    }
+  })
+  return { recomputed, clamped }
+}
+
+/**
+ * 两边按窑炉对账：把每件作品的工序窑号与设备侧窑炉台账比对，
+ * 不一致（或挂的窑炉已删除）即挂起该作品；一致则解除挂起。返回发生变更的件数。
+ */
+export async function syncPieceSuspensions(): Promise<number> {
+  const [pieceRows, stepRows, furnaceRows] = await Promise.all([
+    db.pieces.toArray(),
+    db.steps.toArray(),
+    db.furnaces.toArray(),
+  ])
+  const map = reconcileAll(pieceRows, stepRows, furnaceRows)
+  let changed = 0
+  await db.transaction('rw', db.pieces, async () => {
+    for (const piece of pieceRows) {
+      const result = map.get(piece.id)
+      if (result === undefined) continue
+      if (piece.suspended !== result.suspended || piece.suspendReason !== result.reason) {
+        await db.pieces.update(piece.id, {
+          suspended: result.suspended,
+          suspendReason: result.reason,
+          updatedAt: nowIso(),
+        })
+        changed += 1
+      }
+    }
+  })
+  return changed
+}
+
 /* -------------------------------- 退火 -------------------------------- */
 
 export async function listAnneals(): Promise<Anneal[]> {
@@ -338,6 +467,8 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
     await db.anneals.bulkPut(snapshot.anneals.map((row) => ({ ...row, revision: ROW_REVISION })))
     await db.inspects.bulkPut(snapshot.inspects.map((row) => ({ ...row, revision: ROW_REVISION })))
   })
+  // 导入后按窑炉重新对账，刷新挂起标记
+  await syncPieceSuspensions()
 }
 
 export async function resetDatabase(): Promise<void> {

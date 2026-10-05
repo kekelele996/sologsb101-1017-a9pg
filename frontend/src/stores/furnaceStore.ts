@@ -16,8 +16,10 @@ import {
   initDatabase,
   putBatch,
   putFurnace,
+  recomputeStepsForFurnace,
   removeBatch,
   removeFurnace,
+  syncPieceSuspensions,
 } from '../utils/db'
 import { LOW_REMAIN_KG, isLowRemain } from '../utils/thermal'
 import { nowIso, uuid } from '../utils/id'
@@ -173,19 +175,36 @@ export const useFurnaceStore = defineStore('furnace', () => {
   async function updateFurnace(furnaceId: string, draft: FurnaceDraft): Promise<void> {
     const existing = furnaces.value.find((row) => row.id === furnaceId)
     if (existing === undefined) return
+    const nextCode = draft.code.trim() || existing.code
+    const codeChanged = nextCode !== existing.code
+    const maxTempChanged = draft.maxTempC !== existing.maxTempC
     await putFurnace({
       ...existing,
-      code: draft.code.trim() || existing.code,
+      code: nextCode,
       type: draft.type,
       maxTempC: draft.maxTempC,
       fuelType: draft.fuelType,
       state: draft.state,
     })
+    // 窑炉最高温度改动：对还没推进的工序重算（已完成的老工序留着原样）
+    if (maxTempChanged) {
+      const { recomputed, clamped } = await recomputeStepsForFurnace(furnaceId, draft.maxTempC)
+      if (recomputed > 0) {
+        lastMessage.value = `窑炉上限已改为 ${draft.maxTempC} ℃，已对 ${recomputed} 道未推进工序重算${
+          clamped > 0 ? `，其中 ${clamped} 道温度按新上限卡住` : ''
+        }`
+      }
+    }
+    // 窑号或上限改动后按窑炉重新对账（工序窑号与设备侧不一致即挂起）
+    if (codeChanged || maxTempChanged) {
+      await syncPieceSuspensions()
+    }
     revision.value += 1
   }
 
   async function deleteFurnace(furnaceId: string): Promise<void> {
     await removeFurnace(furnaceId)
+    await syncPieceSuspensions()
     await refreshCounts()
     revision.value += 1
     lastMessage.value = '窑炉及其料液批次已删除'
